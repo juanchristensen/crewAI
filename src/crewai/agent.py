@@ -1,18 +1,21 @@
 import os
+import shutil
+import subprocess
 from inspect import signature
-from typing import Any, List, Optional, Union
+from typing import Any, List, Literal, Optional, Union
+
 from pydantic import Field, InstanceOf, PrivateAttr, model_validator
 
 from crewai.agents import CacheHandler
-from crewai.utilities import Converter, Prompts
-from crewai.tools.agent_tools import AgentTools
-from crewai.agents.crew_agent_executor import CrewAgentExecutor
 from crewai.agents.agent_builder.base_agent import BaseAgent
-from crewai.memory.contextual.contextual_memory import ContextualMemory
-from crewai.utilities.constants import TRAINED_AGENTS_DATA_FILE, TRAINING_DATA_FILE
-from crewai.utilities.training_handler import CrewTrainingHandler
-from crewai.utilities.token_counter_callback import TokenCalcHandler
+from crewai.agents.crew_agent_executor import CrewAgentExecutor
 from crewai.llm import LLM
+from crewai.memory.contextual.contextual_memory import ContextualMemory
+from crewai.tools.agent_tools import AgentTools
+from crewai.utilities import Converter, Prompts
+from crewai.utilities.constants import TRAINED_AGENTS_DATA_FILE, TRAINING_DATA_FILE
+from crewai.utilities.token_counter_callback import TokenCalcHandler
+from crewai.utilities.training_handler import CrewTrainingHandler
 
 
 def mock_agent_ops_provider():
@@ -111,6 +114,10 @@ class Agent(BaseAgent):
         default=2,
         description="Maximum number of retries for an agent to execute a task when an error occurs.",
     )
+    code_execution_mode: Literal["safe", "unsafe"] = Field(
+        default="safe",
+        description="Mode for code execution: 'safe' (using Docker) or 'unsafe' (direct execution).",
+    )
 
     @model_validator(mode="after")
     def post_init_setup(self):
@@ -171,6 +178,9 @@ class Agent(BaseAgent):
 
         if not self.agent_executor:
             self._setup_agent_executor()
+
+        if self.allow_code_execution:
+            self._validate_docker_installation()
 
         return self
 
@@ -292,9 +302,9 @@ class Agent(BaseAgent):
             step_callback=self.step_callback,
             function_calling_llm=self.function_calling_llm,
             respect_context_window=self.respect_context_window,
-            request_within_rpm_limit=self._rpm_controller.check_or_wait
-            if self._rpm_controller
-            else None,
+            request_within_rpm_limit=(
+                self._rpm_controller.check_or_wait if self._rpm_controller else None
+            ),
             callbacks=[TokenCalcHandler(self._token_process)],
         )
 
@@ -307,7 +317,9 @@ class Agent(BaseAgent):
         try:
             from crewai_tools import CodeInterpreterTool
 
-            return [CodeInterpreterTool()]
+            # Set the unsafe_mode based on the code_execution_mode attribute
+            unsafe_mode = self.code_execution_mode == "unsafe"
+            return [CodeInterpreterTool(unsafe_mode=unsafe_mode)]
         except ModuleNotFoundError:
             self._logger.log(
                 "info", "Coding tools not available. Install crewai_tools. "
@@ -393,7 +405,7 @@ class Agent(BaseAgent):
         """
         tool_strings = []
         for tool in tools:
-            args_schema = str(tool.args)
+            args_schema = str(tool.model_fields)
             if hasattr(tool, "func") and tool.func:
                 sig = signature(tool.func)
                 description = (
@@ -406,6 +418,25 @@ class Agent(BaseAgent):
             tool_strings.append(f"{description}\nTool Arguments: {args_schema}")
 
         return "\n".join(tool_strings)
+
+    def _validate_docker_installation(self) -> None:
+        """Check if Docker is installed and running."""
+        if not shutil.which("docker"):
+            raise RuntimeError(
+                f"Docker is not installed. Please install Docker to use code execution with agent: {self.role}"
+            )
+
+        try:
+            subprocess.run(
+                ["docker", "info"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError:
+            raise RuntimeError(
+                f"Docker is not running. Please start Docker to use code execution with agent: {self.role}"
+            )
 
     @staticmethod
     def __tools_names(tools) -> str:

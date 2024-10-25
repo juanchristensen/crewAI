@@ -1,8 +1,14 @@
+# flow.py
+
 import asyncio
 import inspect
 from typing import Any, Callable, Dict, Generic, List, Set, Type, TypeVar, Union
 
 from pydantic import BaseModel
+
+from crewai.flow.flow_visualizer import plot_flow
+from crewai.flow.utils import get_possible_return_constants
+from crewai.telemetry import Telemetry
 
 T = TypeVar("T", bound=Union[BaseModel, Dict[str, Any]])
 
@@ -101,6 +107,7 @@ class FlowMeta(type):
         start_methods = []
         listeners = {}
         routers = {}
+        router_paths = {}
 
         for attr_name, attr_value in dct.items():
             if hasattr(attr_value, "__is_start_method__"):
@@ -115,32 +122,48 @@ class FlowMeta(type):
                 listeners[attr_name] = (condition_type, methods)
             elif hasattr(attr_value, "__is_router__"):
                 routers[attr_value.__router_for__] = attr_name
+                possible_returns = get_possible_return_constants(attr_value)
+                if possible_returns:
+                    router_paths[attr_name] = possible_returns
+
+                # Register router as a listener to its triggering method
+                trigger_method_name = attr_value.__router_for__
+                methods = [trigger_method_name]
+                condition_type = "OR"
+                listeners[attr_name] = (condition_type, methods)
 
         setattr(cls, "_start_methods", start_methods)
         setattr(cls, "_listeners", listeners)
         setattr(cls, "_routers", routers)
+        setattr(cls, "_router_paths", router_paths)
 
         return cls
 
 
 class Flow(Generic[T], metaclass=FlowMeta):
+    _telemetry = Telemetry()
+
     _start_methods: List[str] = []
     _listeners: Dict[str, tuple[str, List[str]]] = {}
     _routers: Dict[str, str] = {}
+    _router_paths: Dict[str, List[str]] = {}
     initial_state: Union[Type[T], T, None] = None
 
-    def __class_getitem__(cls, item):
-        class _FlowGeneric(cls):
-            _initial_state_T = item
+    def __class_getitem__(cls: Type["Flow"], item: Type[T]) -> Type["Flow"]:
+        class _FlowGeneric(cls):  # type: ignore
+            _initial_state_T = item  # type: ignore
 
+        _FlowGeneric.__name__ = f"{cls.__name__}[{item.__name__}]"
         return _FlowGeneric
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._methods: Dict[str, Callable] = {}
-        self._state = self._create_initial_state()
+        self._state: T = self._create_initial_state()
         self._completed_methods: Set[str] = set()
         self._pending_and_listeners: Dict[str, Set[str]] = {}
         self._method_outputs: List[Any] = []  # List to store all method outputs
+
+        self._telemetry.flow_creation_span(self.__class__.__name__)
 
         for method_name in dir(self):
             if callable(getattr(self, method_name)) and not method_name.startswith(
@@ -167,9 +190,16 @@ class Flow(Generic[T], metaclass=FlowMeta):
         """Returns the list of all outputs from executed methods."""
         return self._method_outputs
 
-    async def kickoff(self) -> Any:
+    def kickoff(self) -> Any:
+        return asyncio.run(self.kickoff_async())
+
+    async def kickoff_async(self) -> Any:
         if not self._start_methods:
             raise ValueError("No start method defined")
+
+        self._telemetry.flow_execution_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
 
         # Create tasks for all start methods
         tasks = [
@@ -186,11 +216,11 @@ class Flow(Generic[T], metaclass=FlowMeta):
         else:
             return None  # Or raise an exception if no methods were executed
 
-    async def _execute_start_method(self, start_method: str):
+    async def _execute_start_method(self, start_method: str) -> None:
         result = await self._execute_method(self._methods[start_method])
         await self._execute_listeners(start_method, result)
 
-    async def _execute_method(self, method: Callable, *args, **kwargs):
+    async def _execute_method(self, method: Callable, *args: Any, **kwargs: Any) -> Any:
         result = (
             await method(*args, **kwargs)
             if asyncio.iscoroutinefunction(method)
@@ -199,7 +229,7 @@ class Flow(Generic[T], metaclass=FlowMeta):
         self._method_outputs.append(result)  # Store the output
         return result
 
-    async def _execute_listeners(self, trigger_method: str, result: Any):
+    async def _execute_listeners(self, trigger_method: str, result: Any) -> None:
         listener_tasks = []
 
         if trigger_method in self._routers:
@@ -227,7 +257,7 @@ class Flow(Generic[T], metaclass=FlowMeta):
         # Run all listener tasks concurrently and wait for them to complete
         await asyncio.gather(*listener_tasks)
 
-    async def _execute_single_listener(self, listener: str, result: Any):
+    async def _execute_single_listener(self, listener: str, result: Any) -> None:
         try:
             method = self._methods[listener]
             sig = inspect.signature(method)
@@ -250,3 +280,10 @@ class Flow(Generic[T], metaclass=FlowMeta):
             import traceback
 
             traceback.print_exc()
+
+    def plot(self, filename: str = "crewai_flow") -> None:
+        self._telemetry.flow_plotting_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        plot_flow(self, filename)
