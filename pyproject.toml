@@ -9,7 +9,7 @@ authors = [
 ]
 dependencies = [
     "pydantic>=2.4.2",
-    "langchain>=0.2.16",
+    "langchain>=0.3.1",
     "openai>=1.13.3",
     "opentelemetry-api>=1.22.0",
     "opentelemetry-sdk>=1.22.0",
@@ -21,7 +21,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "appdirs>=1.4.4",
     "jsonref>=1.1.0",
-    "json-repair>=0.25.2",
+    "json-repair>=0.29.10",
     "auth0-python>=4.7.1",
     "litellm>=1.44.22",
     "pyvis>=0.3.2",
